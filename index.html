@@ -80,7 +80,7 @@
 <div class="wrap">
   <header>
     <div>
-      <h1>Hair Advisor <span class="pill" id="mode-pill">demo mode</span></h1>
+      <h1>Hair Advisor</h1>
       <div class="tag">Upload a clear photo of your head/hair. Get a routine, product list, haircut ideas, and a brief to hand your barber.</div>
     </div>
   </header>
@@ -135,7 +135,6 @@ const els = {
   status: document.getElementById('status'),
   result: document.getElementById('result'),
   apikey: document.getElementById('apikey'),
-  modePill: document.getElementById('mode-pill'),
 };
 let imageDataUrl = null;
 let imageEl = null;
@@ -174,11 +173,6 @@ els.reset.addEventListener('click', () => {
   els.result.className = 'result-empty';
   els.result.textContent = 'Your report will appear here.';
   setStatus('Waiting for a photo.');
-});
-
-els.apikey.addEventListener('input', () => {
-  els.modePill.textContent = els.apikey.value.trim() ? 'live: Claude vision' : 'demo mode';
-  els.modePill.classList.toggle('on', !!els.apikey.value.trim());
 });
 
 /* ---------- analyze ---------- */
