@@ -202,8 +202,7 @@ els.analyze.addEventListener('click', async () => {
       setStatus('Done (via Claude).');
     } else {
       setStatus('Analyzing locally…');
-      await new Promise(r => setTimeout(r, 300));
-      const report = analyzeHeuristic(imageEl);
+      const report = await analyzeHeuristic(imageEl);
       lastReport = report;
       renderReport(report, /*isLive*/ false);
       setStatus('Done (heuristic). For a personalized read, add an API key and re-analyze.');
@@ -218,116 +217,140 @@ els.analyze.addEventListener('click', async () => {
 
 function setStatus(t){ els.status.textContent = t; }
 
-/* ---------- heuristic engine (more zones -> more variance) ---------- */
-function analyzeHeuristic(img){
+/* ---------- heuristic engine (face-anchored + k-means + HSL naming) ---------- */
+async function analyzeHeuristic(img){
   const c = document.createElement('canvas');
-  const W = 200, H = Math.max(50, Math.round(200 * (img.naturalHeight/img.naturalWidth || 1)));
+  const maxDim = 400;
+  const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+  const W = Math.round(img.naturalWidth * scale);
+  const H = Math.round(img.naturalHeight * scale);
   c.width = W; c.height = H;
   const ctx = c.getContext('2d');
   ctx.drawImage(img, 0, 0, W, H);
   const data = ctx.getImageData(0, 0, W, H).data;
 
-  // sample 5 zones: crown, left temple, right temple, center part, cheek/skin
-  const zones = {
-    crown:   {x0:.35, x1:.65, y0:.00, y1:.15, px:[]},
-    leftT:   {x0:.10, x1:.30, y0:.05, y1:.30, px:[]},
-    rightT:  {x0:.70, x1:.90, y0:.05, y1:.30, px:[]},
-    partArea:{x0:.40, x1:.60, y0:.15, y1:.35, px:[]},
-    skin:    {x0:.35, x1:.65, y0:.55, y1:.75, px:[]},
-    fullTop: {x0:.05, x1:.95, y0:.00, y1:.40, px:[]},
+  // 1. Find the face -> anchors every other measurement
+  const face = await detectFace(img, W, H, data);
+
+  // 2. Hair region = area above face + margin on either side (avoiding neck/shoulders)
+  const hairBox = {
+    x0: Math.max(0, Math.floor(face.x - face.w * 0.20)),
+    x1: Math.min(W, Math.ceil (face.x + face.w * 1.20)),
+    y0: 0,
+    y1: Math.min(H, Math.floor(face.y + face.h * 0.20)) // include the hairline strip
   };
+  // Skin region = middle of face, avoid eyes and mouth
+  const skinBox = {
+    x0: Math.floor(face.x + face.w * 0.25),
+    x1: Math.floor(face.x + face.w * 0.75),
+    y0: Math.floor(face.y + face.h * 0.55),
+    y1: Math.floor(face.y + face.h * 0.75),
+  };
+  // Temple slices for symmetry / thinning read
+  const leftTempleBox  = {x0: hairBox.x0, x1: Math.floor(face.x + face.w*0.15), y0: face.y - face.h*0.1, y1: face.y + face.h*0.2};
+  const rightTempleBox = {x0: Math.ceil (face.x + face.w*0.85), x1: hairBox.x1, y0: face.y - face.h*0.1, y1: face.y + face.h*0.2};
 
-  for (const k in zones){
-    const z = zones[k];
-    for (let y=Math.floor(z.y0*H); y<Math.floor(z.y1*H); y++){
-      for (let x=Math.floor(z.x0*W); x<Math.floor(z.x1*W); x++){
-        const i = (y*W+x)*4;
-        z.px.push([data[i], data[i+1], data[i+2]]);
-      }
-    }
+  const skinPixels = collect(data, W, H, skinBox);
+  const skinAvg = skinPixels.length ? avgColor(skinPixels) : [200,170,150];
+
+  // 3. Hair-region pixels, filtered to reject background + skin
+  const rawHairPixels = collect(data, W, H, hairBox);
+  const hairPixels = rawHairPixels.filter(p => {
+    const [h,s,l] = rgbToHsl(p);
+    // near-white / near-uniform background
+    if (l > 88 && s < 12) return false;
+    // very saturated pure colors that aren't natural hair (bright red walls, blue skies)
+    if (s > 55 && l > 60 && !(h < 30 || h > 340)) return false;
+    // pixels that match skin closely = forehead
+    if (colorDist(p, skinAvg) < 32) return false;
+    return true;
+  });
+
+  // 4. Dominant hair color via k-means (k=3, take largest cluster)
+  let dominantHair;
+  if (hairPixels.length > 40){
+    const clusters = kmeans(hairPixels, 3, 8);
+    clusters.sort((a,b) => b.size - a.size);
+    dominantHair = clusters[0].centroid;
+  } else {
+    // fell through: not enough pixels survived filtering
+    dominantHair = rawHairPixels.length ? avgColor(rawHairPixels) : [80,60,45];
   }
 
-  const stats = {};
-  for (const k in zones){
-    const px = zones[k].px;
-    stats[k] = {
-      color: avgColor(px),
-      lum: px.length ? px.reduce((s,p)=>s+luminance(p),0)/px.length : 0,
-      lumVar: variance(px.map(luminance)),
-      sat: avgSaturation(px),
-    };
-  }
+  // 5. Name the color from HSL bands
+  const hairShade = nameHairColor(dominantHair);
 
-  const hairColor = stats.fullTop.color;
-  const skinColor = stats.skin.color;
-  const hairLum = stats.fullTop.lum;
-  const varH = stats.fullTop.lumVar;
-  const leftLum = stats.leftT.lum, rightLum = stats.rightT.lum;
-  const symmetry = Math.abs(leftLum - rightLum);
+  // 6. Density from surviving-hair-pixel fraction (fill ratio)
+  const fill = rawHairPixels.length ? hairPixels.length / rawHairPixels.length : 0;
+  const density = fill > 0.85 ? 'thick — full coverage above the face'
+               : fill > 0.65 ? 'medium-thick'
+               : fill > 0.45 ? 'medium'
+               : fill > 0.25 ? 'fine or partially exposed scalp'
+               :                'very short, buzzed, or heavily thinning';
 
-  // shade
-  let hairShade;
-  if (hairLum < 40)       hairShade = 'very dark / true black';
-  else if (hairLum < 70)  hairShade = 'off-black / darkest brown';
-  else if (hairLum < 100) hairShade = 'dark brown';
-  else if (hairLum < 130) hairShade = 'medium brown';
-  else if (hairLum < 165) hairShade = 'light brown / dark blonde';
-  else if (hairLum < 195) hairShade = 'blonde';
-  else                    hairShade = 'very light / platinum or grey';
+  // 7. Type from Sobel edge density in hair region (proxy for curl definition)
+  const edgeDensity = sobelEdgeDensity(data, W, H, hairBox);
+  const typeGuess = edgeDensity < 4  ? 'likely straight (Type 1) — few visible edge transitions'
+                  : edgeDensity < 9  ? 'wavy (Type 2A–2B)'
+                  : edgeDensity < 16 ? 'wavy to loose curl (Type 2C–3A)'
+                  : edgeDensity < 24 ? 'curly (Type 3B–3C)'
+                  :                    'coily (Type 4) — very high texture';
+  const typeConfidence = ' — heuristic, use Live mode for a confirmed reading';
 
-  // density from variance (higher variance = more defined strands / thicker or curlier)
-  const densityScore = varH;
-  const density = densityScore > 1100 ? 'thick — visible strand definition, likely coarse'
-                : densityScore > 700  ? 'medium-thick'
-                : densityScore > 400  ? 'medium'
-                : densityScore > 200  ? 'fine to medium'
-                :                        'fine or very short';
+  // 8. Shine — high L-variance in hair region only
+  const hairLumArr = hairPixels.map(luminance);
+  const lumVar = variance(hairLumArr);
+  const shine = lumVar > 900 ? 'high shine' : lumVar > 500 ? 'moderate sheen' : 'matte finish';
 
-  // curl/wave from variance + edge count
-  const typeGuess = varH < 250
-    ? 'Type 1 (straight) or too short to tell'
-    : varH < 550
-    ? 'Type 2A–2B (loose wave)'
-    : varH < 900
-    ? 'Type 2C–3A (wavy to loose curl)'
-    : varH < 1400
-    ? 'Type 3B–3C (curly)'
-    : 'Type 4 (coily) — very high texture';
-
-  // shine — high mid-range luminance spread suggests shine
-  const shine = varH > 900 ? 'high shine — natural sebum, product, or coarse cuticle catching light'
-              : varH > 500 ? 'moderate sheen'
-              : 'matte finish';
-
-  // undertone from skin sample
-  const [sr,sg,sb] = skinColor;
+  // 9. Undertone from skin
+  const [sr,sg,sb] = skinAvg;
   const undertone = (sr - sb) > 18 ? 'warm undertone (peach/golden)'
                   : (sb - sr) > 10 ? 'cool undertone (pink/blue)'
                   : 'neutral undertone';
 
-  // temple asymmetry note
-  const templeNote = symmetry > 20
-    ? 'Notable brightness difference between left/right temple — could be part direction, light source, or thinning on the brighter side. Check in a mirror.'
-    : 'Temples read symmetric.';
+  // 10. Temple symmetry — using DOMINANT-color match density in each temple
+  const leftT = collect(data, W, H, leftTempleBox);
+  const rightT = collect(data, W, H, rightTempleBox);
+  const leftHairFrac = leftT.length ? leftT.filter(p => colorDist(p, dominantHair) < 45).length / leftT.length : 0;
+  const rightHairFrac = rightT.length ? rightT.filter(p => colorDist(p, dominantHair) < 45).length / rightT.length : 0;
+  const asym = Math.abs(leftHairFrac - rightHairFrac);
+  const templeNote = asym > 0.15
+    ? `Asymmetric coverage between temples (${(leftHairFrac*100).toFixed(0)}% left vs ${(rightHairFrac*100).toFixed(0)}% right). Could be part direction, angle, or uneven recession.`
+    : 'Temple coverage reads symmetric.';
 
-  // saturation of hair -> dyed / natural
-  const dyedHint = stats.fullTop.sat > 55 && hairLum > 100
-    ? 'Hair color reads highly saturated for a natural tone — possibly dyed or heavily sun-lightened.'
+  // 11. Dyed hint
+  const [hh, hs, hl] = rgbToHsl(dominantHair);
+  const dyedHint = (hs > 45 && hl > 45 && !(hh < 30 || hh > 340))
+    ? 'Highly saturated color for a natural tone — possibly dyed.'
     : 'Color reads within natural range.';
 
   return buildReport({
-    hairShade, density, shine, undertone, typeGuess,
-    hairColor, skinColor, templeNote, dyedHint,
+    hairShade, density, shine, undertone,
+    typeGuess: typeGuess + typeConfidence,
+    hairColor: dominantHair, skinColor: skinAvg, templeNote, dyedHint,
     zoneStats: {
-      crown: `L=${stats.crown.lum.toFixed(0)}`,
-      leftT: `L=${stats.leftT.lum.toFixed(0)}`,
-      rightT: `L=${stats.rightT.lum.toFixed(0)}`,
-      part: `L=${stats.partArea.lum.toFixed(0)}`,
-      skin: `L=${stats.skin.lum.toFixed(0)}`,
+      face:   `${face.source}`,
+      hairPx: `${hairPixels.length}/${rawHairPixels.length}`,
+      edges:  `${edgeDensity.toFixed(1)}%`,
+      fill:   `${(fill*100).toFixed(0)}%`,
+      lumVar: `${lumVar.toFixed(0)}`,
     }
   });
 }
 
+/* ---------- helpers: colors, clustering, edges, face ---------- */
+function collect(data, W, H, box){
+  const out = [];
+  const x0 = Math.max(0, Math.floor(box.x0)), x1 = Math.min(W, Math.ceil(box.x1));
+  const y0 = Math.max(0, Math.floor(box.y0)), y1 = Math.min(H, Math.ceil(box.y1));
+  for (let y=y0; y<y1; y++){
+    for (let x=x0; x<x1; x++){
+      const i = (y*W + x) * 4;
+      out.push([data[i], data[i+1], data[i+2]]);
+    }
+  }
+  return out;
+}
 function avgColor(pxs){
   if (!pxs.length) return [0,0,0];
   const s=[0,0,0]; for (const p of pxs){ s[0]+=p[0]; s[1]+=p[1]; s[2]+=p[2]; }
@@ -335,14 +358,160 @@ function avgColor(pxs){
 }
 function luminance([r,g,b]){ return 0.2126*r + 0.7152*g + 0.0722*b; }
 function variance(arr){ if (!arr.length) return 0; const m = arr.reduce((a,b)=>a+b,0)/arr.length; return arr.reduce((a,b)=>a+(b-m)*(b-m),0)/arr.length; }
-function avgSaturation(pxs){
-  if (!pxs.length) return 0;
-  let s = 0;
-  for (const [r,g,b] of pxs){
-    const mx = Math.max(r,g,b), mn = Math.min(r,g,b);
-    s += mx === 0 ? 0 : (mx - mn) / mx * 100;
+function colorDist(a,b){ const dr=a[0]-b[0], dg=a[1]-b[1], db=a[2]-b[2]; return Math.sqrt(dr*dr+dg*dg+db*db); }
+
+function rgbToHsl([r,g,b]){
+  r/=255; g/=255; b/=255;
+  const mx=Math.max(r,g,b), mn=Math.min(r,g,b);
+  let h=0, s=0, l=(mx+mn)/2;
+  if (mx !== mn){
+    const d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    switch(mx){
+      case r: h = ((g - b) / d + (g < b ? 6 : 0)); break;
+      case g: h = ((b - r) / d + 2); break;
+      case b: h = ((r - g) / d + 4); break;
+    }
+    h *= 60;
   }
-  return s / pxs.length;
+  return [h, s*100, l*100];
+}
+
+function nameHairColor(rgb){
+  const [h, s, l] = rgbToHsl(rgb);
+  const hex = '#' + rgb.map(v=>Math.max(0,Math.min(255,v))|0).map(v=>v.toString(16).padStart(2,'0')).join('');
+  // grey / silver / white — very low saturation
+  if (s < 10) {
+    if (l < 15) return `Jet black · ${hex}`;
+    if (l < 32) return `Off-black / very dark grey · ${hex}`;
+    if (l < 55) return `Salt-and-pepper grey · ${hex}`;
+    if (l < 78) return `Silver / grey · ${hex}`;
+    return `White / platinum · ${hex}`;
+  }
+  // red / auburn / copper
+  if ((h < 25 || h > 340) && s > 25 && l > 15 && l < 60) {
+    if (l < 28) return `Deep auburn · ${hex}`;
+    if (l < 42) return `Auburn / dark red · ${hex}`;
+    if (l < 52) return `Copper / red · ${hex}`;
+    return `Strawberry blonde · ${hex}`;
+  }
+  // brown / blonde spectrum
+  if (l < 12) return `Jet black · ${hex}`;
+  if (l < 20) return `Off-black / darkest brown · ${hex}`;
+  if (l < 28) return `Very dark brown · ${hex}`;
+  if (l < 36) return `Dark brown · ${hex}`;
+  if (l < 45) return `Medium brown · ${hex}`;
+  if (l < 55) return `Light brown · ${hex}`;
+  if (l < 65) return `Dark blonde / dirty blonde · ${hex}`;
+  if (l < 75) return `Blonde · ${hex}`;
+  if (l < 85) return `Light / golden blonde · ${hex}`;
+  return `Platinum blonde · ${hex}`;
+}
+
+function kmeans(pixels, k, iters){
+  if (!pixels.length) return [];
+  k = Math.min(k, pixels.length);
+  // deterministic-ish seeding: evenly spaced samples
+  const centroids = [];
+  const step = Math.max(1, Math.floor(pixels.length / k));
+  for (let i=0; i<k; i++) centroids.push([...pixels[Math.min(pixels.length-1, i*step)]]);
+
+  let clusters = Array.from({length:k}, () => []);
+  for (let it=0; it<iters; it++){
+    clusters = Array.from({length:k}, () => []);
+    for (const p of pixels){
+      let best=0, bd=Infinity;
+      for (let i=0; i<k; i++){
+        const d = colorDist(p, centroids[i]);
+        if (d < bd){ bd = d; best = i; }
+      }
+      clusters[best].push(p);
+    }
+    for (let i=0; i<k; i++){
+      if (clusters[i].length) centroids[i] = avgColor(clusters[i]);
+    }
+  }
+  return clusters.map((c, i) => ({centroid: centroids[i], size: c.length}));
+}
+
+function sobelEdgeDensity(data, W, H, box){
+  let edges = 0, total = 0;
+  const x0 = Math.max(1, Math.floor(box.x0));
+  const x1 = Math.min(W-1, Math.ceil(box.x1));
+  const y0 = Math.max(1, Math.floor(box.y0));
+  const y1 = Math.min(H-1, Math.ceil(box.y1));
+  const L = (x,y) => { const i=(y*W+x)*4; return 0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2]; };
+  for (let y=y0; y<y1; y++){
+    for (let x=x0; x<x1; x++){
+      const gx = -L(x-1,y-1) + L(x+1,y-1) - 2*L(x-1,y) + 2*L(x+1,y) - L(x-1,y+1) + L(x+1,y+1);
+      const gy = -L(x-1,y-1) - 2*L(x,y-1) - L(x+1,y-1) + L(x-1,y+1) + 2*L(x,y+1) + L(x+1,y+1);
+      if (Math.hypot(gx, gy) > 45) edges++;
+      total++;
+    }
+  }
+  return total ? (edges / total) * 100 : 0;
+}
+
+// Face detection: use browser FaceDetector when available; fall back to skin-color cluster.
+async function detectFace(img, W, H, data){
+  if ('FaceDetector' in window){
+    try {
+      const detector = new FaceDetector({fastMode: true, maxDetectedFaces: 1});
+      const faces = await detector.detect(img);
+      if (faces.length){
+        const bb = faces[0].boundingBox;
+        const sx = W / img.naturalWidth, sy = H / img.naturalHeight;
+        return {
+          x: Math.max(0, Math.round(bb.x * sx)),
+          y: Math.max(0, Math.round(bb.y * sy)),
+          w: Math.round(bb.width * sx),
+          h: Math.round(bb.height * sy),
+          source: 'FaceDetector'
+        };
+      }
+    } catch(e){ /* fall through */ }
+  }
+  // Fallback: find the densest cluster of skin-toned pixels
+  const isSkin = (r,g,b) => (r > 95 && g > 40 && b > 20 && (Math.max(r,g,b)-Math.min(r,g,b)) > 15 && Math.abs(r-g) > 15 && r > g && r > b);
+  const cells = 10;
+  const cw = Math.floor(W/cells), ch = Math.floor(H/cells);
+  const grid = Array.from({length:cells}, () => new Array(cells).fill(0));
+  for (let cy=0; cy<cells; cy++){
+    for (let cx=0; cx<cells; cx++){
+      let count = 0;
+      for (let y=cy*ch; y<(cy+1)*ch; y++){
+        for (let x=cx*cw; x<(cx+1)*cw; x++){
+          const i = (y*W+x)*4;
+          if (isSkin(data[i], data[i+1], data[i+2])) count++;
+        }
+      }
+      grid[cy][cx] = count;
+    }
+  }
+  // find the connected 3x3 window with most skin pixels
+  let best={score:-1, cx:cells/2, cy:cells/2};
+  for (let cy=1; cy<cells-1; cy++){
+    for (let cx=1; cx<cells-1; cx++){
+      let s = 0;
+      for (let dy=-1; dy<=1; dy++) for (let dx=-1; dx<=1; dx++) s += grid[cy+dy][cx+dx];
+      if (s > best.score) best = {score:s, cx, cy};
+    }
+  }
+  if (best.score > (cw*ch*9*0.05)){
+    return {
+      x: Math.round((best.cx-1) * cw),
+      y: Math.round((best.cy-1) * ch),
+      w: Math.round(3 * cw),
+      h: Math.round(3 * ch),
+      source: 'skin-cluster'
+    };
+  }
+  // last resort: centered box
+  return {
+    x: Math.round(W * 0.30), y: Math.round(H * 0.35),
+    w: Math.round(W * 0.40), h: Math.round(H * 0.45),
+    source: 'centered-guess'
+  };
 }
 
 /* ---------- heuristic report builder ---------- */
