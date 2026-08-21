@@ -242,126 +242,114 @@ async function analyzeHeuristic(img){
   const skinPixels = collect(data, W, H, skinBox);
   const skinAvg = skinPixels.length ? avgColor(skinPixels) : [200,170,150];
 
-  // 3. SEED STRIP: a thin band right at the top of the face bounding box —
-  //    where the transition from hair to face happens. If the person has hair
-  //    at all, hair colour lives here (not out in the corners of the image).
-  const seedBox = {
-    x0: Math.max(0, Math.floor(face.x - face.w * 0.10)),
-    x1: Math.min(W, Math.ceil (face.x + face.w * 1.10)),
-    y0: Math.max(0, Math.floor(face.y - face.h * 0.25)),
-    y1: Math.min(H, Math.floor(face.y + face.h * 0.05)),
-  };
-  const seedPixels = collect(data, W, H, seedBox);
-  // Cluster the seed strip; take the DARKEST large cluster (hair almost
-  // always reads darker than the surrounding skin/background — except platinum).
-  let seedColor = [0,0,0];
-  if (seedPixels.length){
-    const clusters = kmeans(seedPixels, 3, 8);
-    clusters.sort((a,b) => b.size - a.size);
-    const big = clusters.filter(c => c.size >= seedPixels.length * 0.15);
-    // prefer the darkest of the "big" clusters; otherwise fall back to largest
-    if (big.length){
-      big.sort((a,b) => luminance(a.centroid) - luminance(b.centroid));
-      seedColor = big[0].centroid;
-    } else {
-      seedColor = clusters[0].centroid;
+  // 3. MULTI-ZONE COLOR CONSENSUS
+  //    Sample 6 zones above / around the face. For each, k-means with k=2 and
+  //    take the DARKER cluster's centroid (hair is almost always darker than
+  //    its surroundings; the exception is platinum, which is still a distinct
+  //    tight cluster). Then look for agreement across zones — colors within
+  //    30 units of each other in RGB space. Only claim a hair color when at
+  //    least 3 zones agree. Otherwise: refuse to guess.
+  const zoneDefs = [
+    {name: 'crown',        x0: face.x + face.w*0.30, x1: face.x + face.w*0.70, y0: 0,                            y1: face.y - face.h*0.02},
+    {name: 'crown-left',   x0: face.x - face.w*0.10, x1: face.x + face.w*0.35, y0: 0,                            y1: face.y - face.h*0.02},
+    {name: 'crown-right',  x0: face.x + face.w*0.65, x1: face.x + face.w*1.10, y0: 0,                            y1: face.y - face.h*0.02},
+    {name: 'hairline',     x0: face.x + face.w*0.15, x1: face.x + face.w*0.85, y0: Math.max(0, face.y - face.h*0.20), y1: face.y + face.h*0.02},
+    {name: 'temple-left',  x0: Math.max(0, face.x - face.w*0.20), x1: face.x + face.w*0.10, y0: face.y - face.h*0.05, y1: face.y + face.h*0.25},
+    {name: 'temple-right', x0: face.x + face.w*0.90, x1: face.x + face.w*1.20, y0: face.y - face.h*0.05, y1: face.y + face.h*0.25},
+  ];
+
+  const zoneColors = [];
+  for (const z of zoneDefs){
+    const px = collect(data, W, H, z);
+    if (px.length < 40) continue;
+    const clusters = kmeans(px, 2, 8);
+    // pick the DARKER cluster
+    clusters.sort((a,b) => luminance(a.centroid) - luminance(b.centroid));
+    zoneColors.push({name: z.name, color: clusters[0].centroid});
+  }
+
+  // Consensus: for each zone, count how many OTHER zones have a color within 30 units.
+  // Pick the zone with the most agreements; average the agreeing colors.
+  let hairColor = null;
+  let consensusCount = 0;
+  let bestZoneName = '';
+  if (zoneColors.length >= 3){
+    let best = {agreements: 0, color: null, zone: ''};
+    for (const z of zoneColors){
+      const agreeing = zoneColors.filter(o => colorDist(z.color, o.color) < 30);
+      if (agreeing.length > best.agreements){
+        best = {
+          agreements: agreeing.length,
+          color: avgColor(agreeing.map(a => a.color)),
+          zone: z.name
+        };
+      }
+    }
+    if (best.agreements >= 3){
+      hairColor = best.color;
+      consensusCount = best.agreements;
+      bestZoneName = best.zone;
     }
   }
 
-  // 4. BALD CHECK — if the seed cluster is basically skin, the person has no
-  //    (or almost no) visible hair. Report that instead of inventing a colour.
-  const seedSkinDist = colorDist(seedColor, skinAvg);
-  const isBald = seedSkinDist < 50;
+  const isUncertain = !hairColor;
+  const isBald = hairColor && colorDist(hairColor, skinAvg) < 45;
 
-  // 5. Widen to the whole hair region, but ONLY keep pixels near the seed color.
-  //    This rejects bright background walls, ceilings, colored shirts, etc.
-  const hairBox = {
-    x0: Math.max(0, Math.floor(face.x - face.w * 0.20)),
-    x1: Math.min(W, Math.ceil (face.x + face.w * 1.20)),
-    y0: 0,
-    y1: Math.min(H, Math.floor(face.y + face.h * 0.10)),
-  };
-  const rawHairPixels = collect(data, W, H, hairBox);
-  const hairPixels = isBald ? [] : rawHairPixels.filter(p => {
-    if (colorDist(p, seedColor) > 60) return false;      // must resemble seed
-    if (colorDist(p, skinAvg) < 30) return false;        // reject skin
-    return true;
-  });
-
-  // 6. Dominant hair color = average of matched pixels (already noise-filtered)
-  const dominantHair = hairPixels.length > 30 ? avgColor(hairPixels) : seedColor;
   const hairShade = isBald
-    ? `No visible hair — likely shaved or very short (scalp reads ${nameHairColor(skinAvg).split('·')[0].trim()})`
-    : nameHairColor(dominantHair);
+    ? `No visible hair — likely shaved or very short`
+    : isUncertain
+      ? `Could not determine reliably (only ${consensusCount}/${zoneColors.length} zones agreed). Background or lighting is likely interfering. Add API key for accurate Andre Walker classification.`
+      : nameHairColor(hairColor);
 
-  // 7. Density from matched-pixel fill of the wider region
-  const fill = rawHairPixels.length ? hairPixels.length / rawHairPixels.length : 0;
+  // 4. Density — proxy from consensus strength
   const density = isBald ? 'bald / shaved — no measurable hair'
-               : fill > 0.75 ? 'thick — full coverage above the face'
-               : fill > 0.55 ? 'medium-thick'
-               : fill > 0.35 ? 'medium'
-               : fill > 0.15 ? 'fine or partially exposed scalp'
-               :                'very short or heavily thinning';
+               : isUncertain ? 'undetermined — insufficient hair-consistent pixels'
+               : consensusCount >= 6 ? 'thick — hair color consistent across all zones'
+               : consensusCount >= 5 ? 'medium-thick'
+               : consensusCount >= 4 ? 'medium'
+               :                       'sparse or partially thinning — few zones show hair';
 
-  // Temple slices for symmetry
-  const leftTempleBox  = {x0: hairBox.x0, x1: Math.floor(face.x + face.w*0.15), y0: face.y - face.h*0.1, y1: face.y + face.h*0.2};
-  const rightTempleBox = {x0: Math.ceil (face.x + face.w*0.85), x1: hairBox.x1, y0: face.y - face.h*0.1, y1: face.y + face.h*0.2};
+  // 5. Type detection — HEURISTIC CANNOT DO THIS RELIABLY.
+  //    Andre Walker (1A–4C) needs to see strand shape, curl diameter, and
+  //    edge topology. A per-pixel color/variance heuristic will always be
+  //    wrong. Live mode (Claude vision) does this properly.
+  const typeGuess = 'Not determinable from heuristic — Andre Walker classification (1A–4C) requires Live mode.';
 
-  // 8. Type from Sobel — but only measure edges among CONFIRMED hair pixels
-  //    (approximated by upper hair-box with stricter threshold), and be
-  //    honest about the ceiling: heuristic maxes out at "curly", not coily.
-  const edgeDensity = isBald ? 0 : sobelEdgeDensityMasked(data, W, H, hairBox, seedColor, 55);
-  const typeGuess = isBald ? 'n/a — no hair to classify'
-                  : edgeDensity < 5  ? 'likely straight (Type 1) — heuristic estimate'
-                  : edgeDensity < 11 ? 'wavy (Type 2) — heuristic estimate'
-                  : edgeDensity < 20 ? 'curly (Type 3) — heuristic estimate'
-                  : 'very high texture — heuristic can\'t reliably tell Type 3C vs Type 4 from a photo. Use Live mode.';
-  const typeConfidence = '';
-
-  // 8. Shine — high L-variance in hair region only
-  const hairLumArr = hairPixels.map(luminance);
-  const lumVar = variance(hairLumArr);
-  const shine = lumVar > 900 ? 'high shine' : lumVar > 500 ? 'moderate sheen' : 'matte finish';
-
-  // 9. Undertone from skin
+  // 6. Undertone from skin
   const [sr,sg,sb] = skinAvg;
   const undertone = (sr - sb) > 18 ? 'warm undertone (peach/golden)'
                   : (sb - sr) > 10 ? 'cool undertone (pink/blue)'
                   : 'neutral undertone';
 
-  // 10. Temple symmetry (skip when bald)
-  let templeNote = 'n/a — no hair to compare.';
-  if (!isBald){
-    const leftT = collect(data, W, H, leftTempleBox);
-    const rightT = collect(data, W, H, rightTempleBox);
-    const leftHairFrac = leftT.length ? leftT.filter(p => colorDist(p, dominantHair) < 45).length / leftT.length : 0;
-    const rightHairFrac = rightT.length ? rightT.filter(p => colorDist(p, dominantHair) < 45).length / rightT.length : 0;
-    const asym = Math.abs(leftHairFrac - rightHairFrac);
-    templeNote = asym > 0.15
-      ? `Asymmetric coverage between temples (${(leftHairFrac*100).toFixed(0)}% left vs ${(rightHairFrac*100).toFixed(0)}% right). Could be part direction, angle, or uneven recession.`
-      : 'Temple coverage reads symmetric.';
-  }
-
-  // 11. Dyed hint (skip when bald)
+  // 7. Symmetry / dyed hints — only if we found reliable hair
+  let templeNote = 'n/a — no reliable hair reading.';
   let dyedHint = 'n/a';
-  if (!isBald){
-    const [hh, hs, hl] = rgbToHsl(dominantHair);
+  if (hairColor && !isBald){
+    const leftT  = zoneColors.find(z => z.name === 'temple-left');
+    const rightT = zoneColors.find(z => z.name === 'temple-right');
+    if (leftT && rightT){
+      const asym = Math.abs(luminance(leftT.color) - luminance(rightT.color));
+      templeNote = asym > 25
+        ? `Notable brightness gap between temples (L=${luminance(leftT.color).toFixed(0)} vs ${luminance(rightT.color).toFixed(0)}). Could be part direction, lighting, or asymmetric recession.`
+        : 'Temples read symmetric.';
+    }
+    const [hh, hs, hl] = rgbToHsl(hairColor);
     dyedHint = (hs > 45 && hl > 45 && !(hh < 30 || hh > 340))
       ? 'Highly saturated color for a natural tone — possibly dyed.'
       : 'Color reads within natural range.';
   }
 
   return buildReport({
-    hairShade, density, shine, undertone,
-    typeGuess: typeGuess + typeConfidence,
-    hairColor: isBald ? skinAvg : dominantHair,
-    skinColor: skinAvg, templeNote, dyedHint, isBald,
+    hairShade, density, shine: 'not measured in heuristic mode', undertone,
+    typeGuess,
+    hairColor: isBald || isUncertain ? skinAvg : hairColor,
+    skinColor: skinAvg, templeNote, dyedHint, isBald, isUncertain,
     zoneStats: {
       face:      `${face.source}`,
-      seedSkinD: `${seedSkinDist.toFixed(0)}`,
-      hairPx:    `${hairPixels.length}/${rawHairPixels.length}`,
-      fill:      `${(fill*100).toFixed(0)}%`,
-      edges:     `${edgeDensity.toFixed(1)}%`,
+      zonesOK:   `${zoneColors.length}/${zoneDefs.length}`,
+      consensus: `${consensusCount}/${zoneColors.length}`,
+      seedZone:  bestZoneName || '—',
+      skinDist:  hairColor ? `${colorDist(hairColor, skinAvg).toFixed(0)}` : '—',
     }
   });
 }
@@ -627,81 +615,57 @@ function buildBaldReport(x){
 /* ---------- heuristic report builder ---------- */
 function buildReport(x){
   const { hairShade, density, shine, undertone, typeGuess,
-          hairColor, skinColor, templeNote, dyedHint, zoneStats, isBald } = x;
+          hairColor, skinColor, templeNote, dyedHint, zoneStats, isBald, isUncertain } = x;
 
   if (isBald) return buildBaldReport(x);
+  if (isUncertain) return buildUncertainReport(x);
 
-  const isCurly = /Type 3|Type 4|curly/.test(typeGuess);
-  const isWavy = /Type 2|wavy/.test(typeGuess);
-  const isStraight = /Type 1|straight/.test(typeGuess);
+  // Heuristic no longer classifies type — everyone gets generic advice
+  // with a clear "add API key for type-specific routine" pointer.
   const isFine = /fine/.test(density);
-  const isThick = /thick|coarse/.test(density);
+  const isThick = /thick/.test(density);
 
-  const routine = [];
-  routine.push('Wash frequency: ' + (isCurly ? '1–2×/week + co-wash between' : isWavy ? '2–3×/week' : isFine ? '3–4×/week — fine hair gets oily fast' : '3×/week'));
-  routine.push('Conditioner: ' + (isCurly ? 'always, focused mid-lengths to ends; leave in 3–5 min' : 'every wash, focus on the ends only if hair is fine'));
-  if (isThick) routine.push('Weekly protein or moisture mask — thick/coarse hair drinks it up.');
-  routine.push('Scalp: 60-sec massage while shampooing.');
-  routine.push('Heat: air-dry when possible; if blow-drying, heat protectant + medium heat + nozzle down the shaft' + (isCurly ? ' with a diffuser' : ''));
-  routine.push('Sleep on silk/satin — cuts breakage and morning frizz.');
-  routine.push('Trim every ' + (isCurly ? '8–12' : isStraight ? '4–6' : '6–8') + ' weeks.');
+  const routine = [
+    'Wash 2–3×/week with a gentle sulfate-free shampoo (adjust up if scalp is oily fast, down if hair feels dry).',
+    'Condition every wash; if fine hair, only on the ends to avoid weighing down roots.',
+    'Weekly deep-conditioning or protein mask.',
+    'Scalp massage 60 seconds while shampooing.',
+    'Heat: air-dry when possible. If blow-drying, use heat protectant + medium heat, nozzle pointing down the shaft.',
+    'Sleep on silk/satin — reduces breakage and morning frizz.',
+    'Trim every 6–8 weeks to keep shape and remove split ends.'
+  ];
 
-  const products = [];
-  products.push(isCurly ? 'Sulfate-free moisturizing shampoo (curl-specific)' :
-                isWavy  ? 'Gentle sulfate-free shampoo' :
-                isFine  ? 'Volumizing / balancing shampoo (avoid heavy conditioners)' :
-                          'Balancing daily shampoo');
-  products.push(isCurly ? 'Rich conditioner + weekly deep mask' :
-                isWavy  ? 'Lightweight hydrating conditioner' :
-                          'Volumizing conditioner (avoid heavy silicones if roots go flat)');
-  products.push(isCurly ? 'Leave-in cream + curl gel — try the LOC method (liquid → oil → cream)' :
-                isWavy  ? 'Sea-salt spray or a light curl cream / mousse' :
-                          isFine ? 'Root-lift mousse and a light serum for ends' :
-                                   'Lightweight leave-in or serum for ends');
-  products.push('Heat protectant spray (any silicone-based) — always before heat tools.');
-  products.push('Styling: ' + (isCurly ? 'diffuser + gel; scrunch, don\'t brush dry'
-                            : isWavy ? 'sea-salt spray or mousse for texture'
-                            : isFine ? 'matte clay for hold without weighing hair down'
-                            : 'matte clay/paste for hold, or pomade for a slick look'));
+  const products = [
+    'Gentle sulfate-free shampoo (drugstore or salon tier — both work).',
+    isFine ? 'Lightweight volumizing conditioner (avoid heavy silicones).' : 'Hydrating conditioner.',
+    'A leave-in spray or serum for the mid-lengths and ends.',
+    'Heat-protectant spray if you use hot tools.',
+    'A styling product matched to what you want: matte clay for hold + texture, pomade for shine + slick, mousse for volume.'
+  ];
 
-  const haircuts = isCurly
-    ? ['Tapered curly top — length preserved on top, sides tidied via taper (not skin fade)',
-       'Curly fringe / French crop variation — good for framing',
-       'Long layers 8–12cm if you want length — layers prevent triangle shape',
-       'Wash-and-go with 5–8cm on top for lowest effort']
-    : isWavy
-    ? ['Textured crop with mid fade — highlights the wave',
-       'Modern mid-length quiff — 8–12cm on top, tapered sides',
-       'Grown-out mid-length with soft layers — versatile',
-       'Classic side-part with subtle taper — office-clean']
-    : isFine
-    ? ['Textured crop (short and choppy) — creates the illusion of density',
-       'Mid fade with 4–6cm messy top — modern, low-maintenance',
-       'Buzz #2–#3 all over if you want zero maintenance and even coverage',
-       'Avoid long, layered cuts — they emphasize thinness']
-    : ['Textured crop — French/Caesar variant, effortless daily',
-       'Skin/low fade with 4–6cm on top — clean and modern',
-       'Classic side-part or executive contour — polished',
-       'Buzz #2–#3 all over for zero maintenance'];
+  const haircuts = [
+    'Textured crop — versatile, low-maintenance, works with most hair.',
+    'Mid fade with 4–8cm on top — modern and clean.',
+    'Classic side-part or executive contour — polished, office-friendly.',
+    'Buzz #2–#3 all over — zero maintenance option.'
+  ];
 
   const barberBrief = [
-    'What I want (pick one to lead with):',
-    ...(haircuts.slice(0,2).map(h => '  • ' + h)),
+    'What I want (pick one to discuss):',
+    ...haircuts.slice(0,2).map(h => '  • ' + h),
     '',
     'Specs:',
-    '  • Sides: ' + (isCurly ? 'taper (NOT skin fade) so curls don\'t pop harshly' : 'mid fade — clipper #2 to #4, blended'),
-    '  • Top length: ' + (isCurly ? '5–8cm, keep curl pattern intact — scissors over comb ONLY'
-                                  : isWavy ? '7–10cm, point-cut for texture'
-                                  : isFine ? '3–5cm, kept textured to look denser'
-                                  : '5–8cm, layered for movement'),
-    '  • Fringe: ' + (isCurly ? 'natural drop, do not thin' : 'texturized, brow-length'),
-    '  • Neckline: ' + (isCurly ? 'natural / rounded' : 'tapered / squared — your call'),
-    '  • Part: ' + (isStraight ? 'natural — follow the cowlick' : 'no hard part, let it fall'),
+    '  • Sides: mid fade — clipper #2 to #4, blended smooth.',
+    '  • Top length: about 5–7cm, layered / point-cut for movement.',
+    '  • Fringe: brow-length, texturized.',
+    '  • Neckline: your call — tapered rounds, squared is sharper.',
     '',
     'Do NOT:',
-    '  • Do not thin with thinning shears (creates frizz + split ends).',
-    '  • Do not razor ' + (isCurly ? 'curly hair — it splits the cuticle' : 'the top if I want fullness'),
-    '  • Do not go shorter than agreed — err longer, I\'ll come back sooner.'
+    '  • Do not thin with thinning shears — creates frizz and split ends.',
+    '  • Do not razor the top if I want fullness.',
+    '  • Err on the longer side; I\'ll come back sooner if needed.',
+    '',
+    'For a type-specific brief (Andre Walker 1A–4C, exact clipper lengths matched to my hair type), add an Anthropic API key in the app and re-analyze.'
   ].join('\n');
 
   return {
@@ -725,7 +689,43 @@ function buildReport(x){
       'Shedding lags stress by ~3 months — heavy shed now? look back 3 months.'
     ],
     // ephemeral profile for Q&A demo answers
-    profile: { isCurly, isWavy, isStraight, isFine, isThick, hairShade, undertone }
+    profile: { isCurly: false, isWavy: false, isStraight: false, isFine, isThick, hairShade, undertone, typeUnknown: true }
+  };
+}
+
+/* ---------- uncertain report — color couldn't be reliably determined ---------- */
+function buildUncertainReport(x){
+  const { hairShade, density, undertone, zoneStats, hairColor, skinColor } = x;
+  return {
+    basics: {
+      'Reading': 'HEURISTIC COULD NOT RELIABLY IDENTIFY HAIR',
+      'Reason': 'Zones above the face did not agree on a dominant color. Common causes: busy/bright background, hat, unusual lighting, side-angle photo, small face in frame.',
+      'What to do': 'Add an Anthropic API key in the "For accurate results" section and re-analyze. Live mode uses Claude vision and works on nearly any photo.',
+      'Estimated shade': hairShade,
+      'Density read': density,
+      'Skin undertone': undertone,
+    },
+    swatches: { hairColor, skinColor },
+    zoneStats,
+    routine: [
+      'Heuristic mode cannot give a type-specific routine without a reliable hair reading.',
+      'General baseline: wash 2–3×/week with a gentle shampoo, condition every wash, weekly deep-conditioning mask.',
+      'For a personalized Andre Walker (1A–4C) routine, use Live mode with an API key.'
+    ],
+    products: [
+      'Add an API key to get product recommendations matched to your specific type/porosity.'
+    ],
+    haircuts: [
+      'Cannot recommend haircuts without knowing your hair type and face shape reliably.',
+      'Add an API key and re-analyze for personalized haircut ideas tied to what Claude sees in your photo.'
+    ],
+    barberBrief: 'Cannot generate a barber brief in heuristic mode — Live mode is required for accurate Andre Walker classification and matching clipper lengths.',
+    care: [
+      'Sunscreen on scalp / part-line if you\'re outdoors much.',
+      'Silk pillowcase reduces breakage regardless of type.',
+      'Trim every 6–8 weeks unless growing out.',
+    ],
+    profile: { isCurly: false, isWavy: false, isStraight: false, isFine: false, isThick: false, hairShade, undertone, typeUnknown: true, uncertain: true }
   };
 }
 
@@ -918,31 +918,47 @@ async function analyzeWithClaude(dataUrl, key){
 
   const system = `You are a professional barber and trichologist writing a personalized brief for the person in the photo.
 
+CLASSIFICATION SYSTEM — always use the Andre Walker Hair Typing System for the "Estimated type" field. Format: "<Type> — <one-line description of what you see>". Valid values:
+  • 1A — pin-straight, fine, very soft, no body
+  • 1B — straight with slight body, medium texture
+  • 1C — straight, coarse, thick strands, resistant to curling
+  • 2A — loose S-wave, fine to medium
+  • 2B — defined S-wave, sticks close to head
+  • 2C — thick waves with some spiral curls forming
+  • 3A — loose spiral curls, ~3cm curl diameter
+  • 3B — springy ringlets, ~2cm curl diameter
+  • 3C — tight corkscrew curls, ~1.5cm diameter
+  • 4A — soft coils, tight S-pattern, ~pencil-width curl
+  • 4B — Z-pattern zig-zag, sharp bends rather than curls
+  • 4C — tightest coils, almost no visible curl definition, most shrinkage
+If you cannot see enough hair to classify (bald, hat, side-view without hair visible), say so — do NOT guess. Never use vague labels like "curly" alone.
+
 CRITICAL rules for uniqueness — the report MUST feel like it was written about THIS person, not a template:
   • Ground every claim in a SPECIFIC observation from the photo (e.g. "your left temple recedes about 1cm further than your right", "the crown shows a double cowlick swirling clockwise", "part is on the left side, roughly 3cm off-center", "hair length ~4cm on top, ~1cm on sides", "visible product residue near the roots suggests wax build-up").
   • Never write generic filler like "healthy shine" or "gorgeous texture" — describe what you actually see.
   • If you cannot see something (e.g. back of head), say so — do not guess.
+  • For "Estimated shade": describe the actual color you see (e.g. "cool dark brown with subtle grey at both temples, hex ≈ #2b1f18"). Do NOT default to generic "brown" — pick from black / off-black / very dark brown / dark brown / medium brown / light brown / dark blonde / blonde / light blonde / platinum / grey / auburn / copper / red, then modify with warm/cool/neutral.
   • Recommend specific product categories with example brand-tier hints (drugstore vs. professional), not just "moisturizing shampoo".
-  • For haircuts, tie each recommendation to a specific facial or head feature you observed.
+  • For haircuts, tie each recommendation to a specific facial or head feature you observed AND to the Andre Walker type (e.g. "3B benefits from a curly taper because a skin fade makes the curl edge harsh").
   • For the barber brief, use exact clipper numbers, cm lengths, and specific technique names.
 
 Reply with ONLY a compact JSON matching this TypeScript type — no prose, no markdown fences:
 {
   "basics": {
     "Face shape": string,
-    "Estimated type": string,     // e.g. "Type 2B (wavy, defined S-shape)"
-    "Estimated shade": string,    // e.g. "cool dark brown with grey at temples"
-    "Density": string,            // e.g. "medium-thick with slight thinning at the crown"
+    "Estimated type": string,     // MUST use Andre Walker format above
+    "Estimated shade": string,    // specific color + hex if you can estimate
+    "Density": string,            // low / medium / high, and thinning notes if visible
     "Length read": string,        // approximate cm at top / sides / back if visible
     "Hairline": string,           // e.g. "widow's peak, slight recession at both temples"
     "Condition": string,          // e.g. "dry ends, oily roots, split ends visible on the right side"
     "Cowlick / part": string      // observed part or cowlick pattern
   },
   "observations": string[],       // 4-6 specific things you SEE, one per line
-  "routine": string[],
+  "routine": string[],            // MUST be tailored to the Andre Walker type
   "products": string[],           // include specific brand-tier suggestions
-  "haircuts": string[],           // each tied to an observed feature
-  "barberBrief": string,          // plain text block, exact numbers/lengths
+  "haircuts": string[],           // each tied to an observed feature + type
+  "barberBrief": string,          // plain text block, exact numbers/lengths, type-appropriate technique
   "care": string[]
 }`;
   const body = {
