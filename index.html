@@ -232,70 +232,91 @@ async function analyzeHeuristic(img){
   // 1. Find the face -> anchors every other measurement
   const face = await detectFace(img, W, H, data);
 
-  // 2. Hair region = area above face + margin on either side (avoiding neck/shoulders)
-  const hairBox = {
-    x0: Math.max(0, Math.floor(face.x - face.w * 0.20)),
-    x1: Math.min(W, Math.ceil (face.x + face.w * 1.20)),
-    y0: 0,
-    y1: Math.min(H, Math.floor(face.y + face.h * 0.20)) // include the hairline strip
-  };
-  // Skin region = middle of face, avoid eyes and mouth
+  // 2. Skin sample (cheek) — used both as filter reference and for bald detection
   const skinBox = {
     x0: Math.floor(face.x + face.w * 0.25),
     x1: Math.floor(face.x + face.w * 0.75),
     y0: Math.floor(face.y + face.h * 0.55),
     y1: Math.floor(face.y + face.h * 0.75),
   };
-  // Temple slices for symmetry / thinning read
-  const leftTempleBox  = {x0: hairBox.x0, x1: Math.floor(face.x + face.w*0.15), y0: face.y - face.h*0.1, y1: face.y + face.h*0.2};
-  const rightTempleBox = {x0: Math.ceil (face.x + face.w*0.85), x1: hairBox.x1, y0: face.y - face.h*0.1, y1: face.y + face.h*0.2};
-
   const skinPixels = collect(data, W, H, skinBox);
   const skinAvg = skinPixels.length ? avgColor(skinPixels) : [200,170,150];
 
-  // 3. Hair-region pixels, filtered to reject background + skin
+  // 3. SEED STRIP: a thin band right at the top of the face bounding box —
+  //    where the transition from hair to face happens. If the person has hair
+  //    at all, hair colour lives here (not out in the corners of the image).
+  const seedBox = {
+    x0: Math.max(0, Math.floor(face.x - face.w * 0.10)),
+    x1: Math.min(W, Math.ceil (face.x + face.w * 1.10)),
+    y0: Math.max(0, Math.floor(face.y - face.h * 0.25)),
+    y1: Math.min(H, Math.floor(face.y + face.h * 0.05)),
+  };
+  const seedPixels = collect(data, W, H, seedBox);
+  // Cluster the seed strip; take the DARKEST large cluster (hair almost
+  // always reads darker than the surrounding skin/background — except platinum).
+  let seedColor = [0,0,0];
+  if (seedPixels.length){
+    const clusters = kmeans(seedPixels, 3, 8);
+    clusters.sort((a,b) => b.size - a.size);
+    const big = clusters.filter(c => c.size >= seedPixels.length * 0.15);
+    // prefer the darkest of the "big" clusters; otherwise fall back to largest
+    if (big.length){
+      big.sort((a,b) => luminance(a.centroid) - luminance(b.centroid));
+      seedColor = big[0].centroid;
+    } else {
+      seedColor = clusters[0].centroid;
+    }
+  }
+
+  // 4. BALD CHECK — if the seed cluster is basically skin, the person has no
+  //    (or almost no) visible hair. Report that instead of inventing a colour.
+  const seedSkinDist = colorDist(seedColor, skinAvg);
+  const isBald = seedSkinDist < 50;
+
+  // 5. Widen to the whole hair region, but ONLY keep pixels near the seed color.
+  //    This rejects bright background walls, ceilings, colored shirts, etc.
+  const hairBox = {
+    x0: Math.max(0, Math.floor(face.x - face.w * 0.20)),
+    x1: Math.min(W, Math.ceil (face.x + face.w * 1.20)),
+    y0: 0,
+    y1: Math.min(H, Math.floor(face.y + face.h * 0.10)),
+  };
   const rawHairPixels = collect(data, W, H, hairBox);
-  const hairPixels = rawHairPixels.filter(p => {
-    const [h,s,l] = rgbToHsl(p);
-    // near-white / near-uniform background
-    if (l > 88 && s < 12) return false;
-    // very saturated pure colors that aren't natural hair (bright red walls, blue skies)
-    if (s > 55 && l > 60 && !(h < 30 || h > 340)) return false;
-    // pixels that match skin closely = forehead
-    if (colorDist(p, skinAvg) < 32) return false;
+  const hairPixels = isBald ? [] : rawHairPixels.filter(p => {
+    if (colorDist(p, seedColor) > 60) return false;      // must resemble seed
+    if (colorDist(p, skinAvg) < 30) return false;        // reject skin
     return true;
   });
 
-  // 4. Dominant hair color via k-means (k=3, take largest cluster)
-  let dominantHair;
-  if (hairPixels.length > 40){
-    const clusters = kmeans(hairPixels, 3, 8);
-    clusters.sort((a,b) => b.size - a.size);
-    dominantHair = clusters[0].centroid;
-  } else {
-    // fell through: not enough pixels survived filtering
-    dominantHair = rawHairPixels.length ? avgColor(rawHairPixels) : [80,60,45];
-  }
+  // 6. Dominant hair color = average of matched pixels (already noise-filtered)
+  const dominantHair = hairPixels.length > 30 ? avgColor(hairPixels) : seedColor;
+  const hairShade = isBald
+    ? `No visible hair — likely shaved or very short (scalp reads ${nameHairColor(skinAvg).split('·')[0].trim()})`
+    : nameHairColor(dominantHair);
 
-  // 5. Name the color from HSL bands
-  const hairShade = nameHairColor(dominantHair);
-
-  // 6. Density from surviving-hair-pixel fraction (fill ratio)
+  // 7. Density from matched-pixel fill of the wider region
   const fill = rawHairPixels.length ? hairPixels.length / rawHairPixels.length : 0;
-  const density = fill > 0.85 ? 'thick — full coverage above the face'
-               : fill > 0.65 ? 'medium-thick'
-               : fill > 0.45 ? 'medium'
-               : fill > 0.25 ? 'fine or partially exposed scalp'
-               :                'very short, buzzed, or heavily thinning';
+  const density = isBald ? 'bald / shaved — no measurable hair'
+               : fill > 0.75 ? 'thick — full coverage above the face'
+               : fill > 0.55 ? 'medium-thick'
+               : fill > 0.35 ? 'medium'
+               : fill > 0.15 ? 'fine or partially exposed scalp'
+               :                'very short or heavily thinning';
 
-  // 7. Type from Sobel edge density in hair region (proxy for curl definition)
-  const edgeDensity = sobelEdgeDensity(data, W, H, hairBox);
-  const typeGuess = edgeDensity < 4  ? 'likely straight (Type 1) — few visible edge transitions'
-                  : edgeDensity < 9  ? 'wavy (Type 2A–2B)'
-                  : edgeDensity < 16 ? 'wavy to loose curl (Type 2C–3A)'
-                  : edgeDensity < 24 ? 'curly (Type 3B–3C)'
-                  :                    'coily (Type 4) — very high texture';
-  const typeConfidence = ' — heuristic, use Live mode for a confirmed reading';
+  // Temple slices for symmetry
+  const leftTempleBox  = {x0: hairBox.x0, x1: Math.floor(face.x + face.w*0.15), y0: face.y - face.h*0.1, y1: face.y + face.h*0.2};
+  const rightTempleBox = {x0: Math.ceil (face.x + face.w*0.85), x1: hairBox.x1, y0: face.y - face.h*0.1, y1: face.y + face.h*0.2};
+
+  // 8. Type from Sobel — but only measure edges among CONFIRMED hair pixels
+  //    (approximated by upper hair-box with stricter threshold), and be
+  //    honest about the ceiling: heuristic maxes out at "curly", not coily.
+  const edgeDensity = isBald ? 0 : sobelEdgeDensityMasked(data, W, H, hairBox, seedColor, 55);
+  const typeGuess = isBald ? 'n/a — no hair to classify'
+                  : edgeDensity < 5  ? 'likely straight (Type 1) — heuristic estimate'
+                  : edgeDensity < 11 ? 'wavy (Type 2) — heuristic estimate'
+                  : edgeDensity < 20 ? 'curly (Type 3) — heuristic estimate'
+                  : 'very high texture — heuristic can\'t reliably tell Type 3C vs Type 4 from a photo. Use Live mode.';
+  const typeConfidence = '';
 
   // 8. Shine — high L-variance in hair region only
   const hairLumArr = hairPixels.map(luminance);
@@ -308,32 +329,39 @@ async function analyzeHeuristic(img){
                   : (sb - sr) > 10 ? 'cool undertone (pink/blue)'
                   : 'neutral undertone';
 
-  // 10. Temple symmetry — using DOMINANT-color match density in each temple
-  const leftT = collect(data, W, H, leftTempleBox);
-  const rightT = collect(data, W, H, rightTempleBox);
-  const leftHairFrac = leftT.length ? leftT.filter(p => colorDist(p, dominantHair) < 45).length / leftT.length : 0;
-  const rightHairFrac = rightT.length ? rightT.filter(p => colorDist(p, dominantHair) < 45).length / rightT.length : 0;
-  const asym = Math.abs(leftHairFrac - rightHairFrac);
-  const templeNote = asym > 0.15
-    ? `Asymmetric coverage between temples (${(leftHairFrac*100).toFixed(0)}% left vs ${(rightHairFrac*100).toFixed(0)}% right). Could be part direction, angle, or uneven recession.`
-    : 'Temple coverage reads symmetric.';
+  // 10. Temple symmetry (skip when bald)
+  let templeNote = 'n/a — no hair to compare.';
+  if (!isBald){
+    const leftT = collect(data, W, H, leftTempleBox);
+    const rightT = collect(data, W, H, rightTempleBox);
+    const leftHairFrac = leftT.length ? leftT.filter(p => colorDist(p, dominantHair) < 45).length / leftT.length : 0;
+    const rightHairFrac = rightT.length ? rightT.filter(p => colorDist(p, dominantHair) < 45).length / rightT.length : 0;
+    const asym = Math.abs(leftHairFrac - rightHairFrac);
+    templeNote = asym > 0.15
+      ? `Asymmetric coverage between temples (${(leftHairFrac*100).toFixed(0)}% left vs ${(rightHairFrac*100).toFixed(0)}% right). Could be part direction, angle, or uneven recession.`
+      : 'Temple coverage reads symmetric.';
+  }
 
-  // 11. Dyed hint
-  const [hh, hs, hl] = rgbToHsl(dominantHair);
-  const dyedHint = (hs > 45 && hl > 45 && !(hh < 30 || hh > 340))
-    ? 'Highly saturated color for a natural tone — possibly dyed.'
-    : 'Color reads within natural range.';
+  // 11. Dyed hint (skip when bald)
+  let dyedHint = 'n/a';
+  if (!isBald){
+    const [hh, hs, hl] = rgbToHsl(dominantHair);
+    dyedHint = (hs > 45 && hl > 45 && !(hh < 30 || hh > 340))
+      ? 'Highly saturated color for a natural tone — possibly dyed.'
+      : 'Color reads within natural range.';
+  }
 
   return buildReport({
     hairShade, density, shine, undertone,
     typeGuess: typeGuess + typeConfidence,
-    hairColor: dominantHair, skinColor: skinAvg, templeNote, dyedHint,
+    hairColor: isBald ? skinAvg : dominantHair,
+    skinColor: skinAvg, templeNote, dyedHint, isBald,
     zoneStats: {
-      face:   `${face.source}`,
-      hairPx: `${hairPixels.length}/${rawHairPixels.length}`,
-      edges:  `${edgeDensity.toFixed(1)}%`,
-      fill:   `${(fill*100).toFixed(0)}%`,
-      lumVar: `${lumVar.toFixed(0)}`,
+      face:      `${face.source}`,
+      seedSkinD: `${seedSkinDist.toFixed(0)}`,
+      hairPx:    `${hairPixels.length}/${rawHairPixels.length}`,
+      fill:      `${(fill*100).toFixed(0)}%`,
+      edges:     `${edgeDensity.toFixed(1)}%`,
     }
   });
 }
@@ -452,6 +480,33 @@ function sobelEdgeDensity(data, W, H, box){
   return total ? (edges / total) * 100 : 0;
 }
 
+// Sobel edge density restricted to confirmed hair pixels (those matching seedColor).
+// Higher threshold + only-hair sampling avoids counting forehead wrinkles, background
+// transitions, or hair-vs-skin borders as "curl texture" edges.
+function sobelEdgeDensityMasked(data, W, H, box, seedColor, threshold){
+  let edges = 0, total = 0;
+  const x0 = Math.max(1, Math.floor(box.x0));
+  const x1 = Math.min(W-1, Math.ceil(box.x1));
+  const y0 = Math.max(1, Math.floor(box.y0));
+  const y1 = Math.min(H-1, Math.ceil(box.y1));
+  const L = (x,y) => { const i=(y*W+x)*4; return 0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2]; };
+  const isHair = (x,y) => {
+    const i=(y*W+x)*4;
+    const dr=data[i]-seedColor[0], dg=data[i+1]-seedColor[1], db=data[i+2]-seedColor[2];
+    return (dr*dr + dg*dg + db*db) < 60*60;
+  };
+  for (let y=y0; y<y1; y++){
+    for (let x=x0; x<x1; x++){
+      if (!isHair(x,y)) continue;
+      const gx = -L(x-1,y-1) + L(x+1,y-1) - 2*L(x-1,y) + 2*L(x+1,y) - L(x-1,y+1) + L(x+1,y+1);
+      const gy = -L(x-1,y-1) - 2*L(x,y-1) - L(x+1,y-1) + L(x-1,y+1) + 2*L(x,y+1) + L(x+1,y+1);
+      if (Math.hypot(gx, gy) > threshold) edges++;
+      total++;
+    }
+  }
+  return total ? (edges / total) * 100 : 0;
+}
+
 // Face detection: use browser FaceDetector when available; fall back to skin-color cluster.
 async function detectFace(img, W, H, data){
   if ('FaceDetector' in window){
@@ -514,14 +569,71 @@ async function detectFace(img, W, H, data){
   };
 }
 
+/* ---------- bald / shaved report ---------- */
+function buildBaldReport(x){
+  const { hairShade, density, shine, undertone, templeNote, dyedHint, zoneStats, hairColor, skinColor } = x;
+  return {
+    basics: {
+      'Estimated type': 'n/a — no measurable hair (bald / shaved / very short)',
+      'Estimated shade': hairShade,
+      'Density read': density,
+      'Surface': 'n/a',
+      'Skin undertone': undertone,
+      'Symmetry note': templeNote,
+      'Color note': dyedHint,
+    },
+    swatches: { hairColor, skinColor },
+    zoneStats,
+    routine: [
+      'Wash the scalp 3–4×/week with a gentle sulfate-free cleanser; skin oils build up faster without hair.',
+      'Moisturize daily — a light unfragranced face/body cream on the scalp keeps it from flaking.',
+      'Exfoliate 1×/week with a soft scalp scrub or a face exfoliant. Removes buildup, prevents ingrown-hair bumps.',
+      'Shave with a sharp razor and pre-shave oil; shave WITH the grain to reduce irritation.',
+      'Sunscreen SPF 30+ on the scalp every day outside — bald heads sunburn fast and skin cancer risk is real.',
+      'If you notice patchy re-growth, dermatologist visit — could be alopecia, could be reversible.'
+    ],
+    products: [
+      'Gentle sulfate-free body/face wash (also fine for scalp).',
+      'Light daily moisturizer (CeraVe, La Roche-Posay, or similar).',
+      'Broad-spectrum SPF 30–50 (mineral if you burn easily).',
+      'Pre-shave oil + sharp double-edge or 5-blade razor.',
+      'Optional: matte scalp balm if the shine bothers you (Every Man Jack, Bee Bald).'
+    ],
+    haircuts: [
+      'Stay clean-shaven — 2–3× per week to keep the look sharp.',
+      'Grow to a #1–#2 buzz all over for texture without losing simplicity.',
+      'Grow the sides to a tight fade and stay bald on top for the "smart bald" look.',
+      'If regrowth is patchy or thinning, consult a derm about minoxidil/finasteride — earlier is dramatically better.'
+    ],
+    barberBrief:
+      'What I want:\n' +
+      '  • Full clean shave, or a #0 blade all over, whichever is fastest.\n' +
+      '  • Sharp line-up at the temples and neckline.\n' +
+      '  • Ear detail included.\n\n' +
+      'Do NOT:\n' +
+      '  • Do not shave dry — hot towel or oil first.\n' +
+      '  • Do not go against the grain on the neck — I break out.',
+    care: [
+      'Sunscreen daily — this is the single biggest thing.',
+      'Watch for moles or new spots on the scalp; ask a derm to check annually.',
+      'Dry patches or dandruff on a bald head → try a zinc pyrithione or ketoconazole wash weekly.',
+      'Sleep on a pillowcase you wash weekly — helps prevent scalp acne.',
+      'If you want hair back: minoxidil is OTC and works for many; results take 4–6 months.'
+    ],
+    profile: { isBald: true, isCurly: false, isWavy: false, isStraight: false, isFine: false, isThick: false, hairShade, undertone }
+  };
+}
+
 /* ---------- heuristic report builder ---------- */
 function buildReport(x){
   const { hairShade, density, shine, undertone, typeGuess,
-          hairColor, skinColor, templeNote, dyedHint, zoneStats } = x;
+          hairColor, skinColor, templeNote, dyedHint, zoneStats, isBald } = x;
 
-  const isCurly = /Type 3|Type 4/.test(typeGuess);
-  const isWavy = /Type 2/.test(typeGuess);
-  const isStraight = /Type 1/.test(typeGuess);
+  if (isBald) return buildBaldReport(x);
+
+  const isCurly = /Type 3|Type 4|curly/.test(typeGuess);
+  const isWavy = /Type 2|wavy/.test(typeGuess);
+  const isStraight = /Type 1|straight/.test(typeGuess);
   const isFine = /fine/.test(density);
   const isThick = /thick|coarse/.test(density);
 
